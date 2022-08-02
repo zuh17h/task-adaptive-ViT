@@ -42,7 +42,7 @@ def get_loader(args):
                                     transforms.ToTensor(),
                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
                             )
-        testset = CarsDataset(os.path.join(args.data_root,'cars_test_annos_withlabels.mat'),
+        testset = CarsDataset(os.path.join(args.data_root,'devkit/cars_test_annos_withlabels.mat'),
                             os.path.join(args.data_root,'cars_test'),
                             os.path.join(args.data_root,'devkit/cars_meta.mat'),
                             # cleaned=os.path.join(data_dir,'cleaned_test.dat'),
