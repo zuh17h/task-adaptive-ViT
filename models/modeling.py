@@ -19,6 +19,7 @@ from torch.nn.modules.utils import _pair
 from scipy import ndimage
 
 import models.configs as configs
+from utils.drop_and_restore_utils import apply_chunking_to_forward
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,11 @@ def np2th(weights, conv=False):
 
 def swish(x):
     return x * torch.sigmoid(x)
+
+def expand_gather(input, dim, index):
+    size = list(input.size())
+    size[dim] = -1
+    return input.gather(dim, index.expand(*size))
 
 ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "swish": swish}
 
@@ -65,8 +71,9 @@ class LabelSmoothing(nn.Module):
         return loss.mean()
 
 class Attention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, vis):
         super(Attention, self).__init__()
+        self.vis = vis
         self.num_attention_heads = config.transformer["num_heads"]
         self.attention_head_size = int(config.hidden_size / self.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
@@ -175,25 +182,35 @@ class Embeddings(nn.Module):
         return embeddings
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, vis):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn = Mlp(config)
-        self.attn = Attention(config)
+        self.attn = Attention(config, vis)
 
-    def forward(self, x):
+    def forward(self, x, output_length=None):
         h = x
         x = self.attention_norm(x)
         x, weights = self.attn(x)
         x = x + h
 
+        if output_length is not None:
+            significance_score = weights.sum(2).sum(1)
+            keep_indices = significance_score[:, 1:].topk(output_length - 1, 1)[1] + 1
+            cls_index = keep_indices.new_zeros((keep_indices.size(0), 1))
+            keep_indices = torch.cat((cls_index, keep_indices), 1)
+            x = expand_gather(x, 1, keep_indices.unsqueeze(-1))
+        else:
+            keep_indices = None
+
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
+        #x = apply_chunking_to_forward(self.ffn, 0, 1, x)
         x = x + h
-        return x, weights
+        return x, keep_indices
 
     def load_from(self, weights, n_block):
         ROOT = f"Transformer/encoderblock_{n_block}"
@@ -247,78 +264,89 @@ class Part_Attention(nn.Module):
         return _, max_inx
 
 class Encoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, vis):
         super(Encoder, self).__init__()
+        self.vis = vis
         self.layer = nn.ModuleList()
-        for _ in range(config.transformer["num_layers"] - 1):
-            layer = Block(config)
+        self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
+        for _ in range(config.transformer["num_layers"]):
+            layer = Block(config, vis)
             self.layer.append(copy.deepcopy(layer))
-        self.part_select = Part_Attention()
-        self.part_layer = Block(config)
-        self.part_norm = LayerNorm(config.hidden_size, eps=1e-6)
 
-    def forward(self, hidden_states):
-        attn_weights = []
-        for layer in self.layer:
-            hidden_states, weights = layer(hidden_states)
-            attn_weights.append(weights)            
-        part_num, part_inx = self.part_select(attn_weights)
-        part_inx = part_inx + 1
-        parts = []
-        B, num = part_inx.shape
-        for i in range(B):
-            parts.append(hidden_states[i, part_inx[i,:]])
-        parts = torch.stack(parts).squeeze(1)
-        concat = torch.cat((hidden_states[:,0].unsqueeze(1), parts), dim=1)
-        part_states, part_weights = self.part_layer(concat)
-        part_encoded = self.part_norm(part_states)   
+    def forward(self, hidden_states, layer_config, length_config):
+        bsz, tsz, dim = hidden_states.size()
 
-        return part_encoded
+        if length_config is not None:
+            restored_hidden_states = hidden_states
+            remain_indices = torch.arange(tsz, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
+
+        for i, layer_block in enumerate(self.layer):
+            if layer_config is not None and i not in layer_config:
+                continue
+            
+            layer_output_length = length_config[i] if length_config is not None else None
+            hidden_states, keep_indices = layer_block(hidden_states, output_length=layer_output_length)
+            
+            if layer_output_length:
+                remain_indices = remain_indices.gather(1, keep_indices)
+                restored_hidden_states = restored_hidden_states.scatter(1, remain_indices.unsqueeze(-1).expand(-1, -1, dim), hidden_states)
+
+        last_hidden_state = restored_hidden_states if length_config is not None else hidden_states
+        encoded = self.encoder_norm(last_hidden_state)
+        return encoded
 
 class Transformer(nn.Module):
-    def __init__(self, config, img_size):
+    def __init__(self, config, img_size, vis):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
-        self.encoder = Encoder(config)
+        self.encoder = Encoder(config, vis)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, layer_config, length_config):
         embedding_output = self.embeddings(input_ids)
-        part_encoded = self.encoder(embedding_output)
-        return part_encoded
+        encoded = self.encoder(embedding_output, layer_config, length_config)
+        return encoded
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, smoothing_value=0, zero_head=False):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
-        self.smoothing_value = smoothing_value
         self.zero_head = zero_head
         self.classifier = config.classifier
-        self.transformer = Transformer(config, img_size)
-        self.part_head = Linear(config.hidden_size, num_classes)
 
-    def forward(self, x, labels=None):
-        part_tokens = self.transformer(x)
-        part_logits = self.part_head(part_tokens[:, 0])
+        self.transformer = Transformer(config, img_size, vis)
+        self.head = Linear(config.hidden_size, num_classes)
+
+    def forward(
+        self, 
+        x, 
+        labels=None,
+        layer_config=None,
+        length_config=None,
+        ):
+        x = self.transformer(x, layer_config, length_config)
+        logits = self.head(x[:, 0])
 
         if labels is not None:
-            if self.smoothing_value == 0:
-                loss_fct = CrossEntropyLoss()
-            else:
-                loss_fct = LabelSmoothing(self.smoothing_value)
-            part_loss = loss_fct(part_logits.view(-1, self.num_classes), labels.view(-1))
-            contrast_loss = con_loss(part_tokens[:, 0], labels.view(-1))
-            loss = part_loss + contrast_loss
-            return loss, part_logits
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss, logits
         else:
-            return part_logits
+            return logits
 
     def load_from(self, weights):
         with torch.no_grad():
+            if self.zero_head:
+                nn.init.zeros_(self.head.weight)
+                nn.init.zeros_(self.head.bias)
+            else:
+                self.head.weight.copy_(np2th(weights["head/kernel"]).t())
+                self.head.bias.copy_(np2th(weights["head/bias"]).t())
+
             self.transformer.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
             self.transformer.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
             self.transformer.embeddings.cls_token.copy_(np2th(weights["cls"]))
-            self.transformer.encoder.part_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
-            self.transformer.encoder.part_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+            self.transformer.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+            self.transformer.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
 
             posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
             posemb_new = self.transformer.embeddings.position_embeddings
@@ -346,9 +374,8 @@ class VisionTransformer(nn.Module):
                 self.transformer.embeddings.position_embeddings.copy_(np2th(posemb))
 
             for bname, block in self.transformer.encoder.named_children():
-                if bname.startswith('part') == False:
-                    for uname, unit in block.named_children():
-                        unit.load_from(weights, n_block=uname)
+                for uname, unit in block.named_children():
+                    unit.load_from(weights, n_block=uname)
 
             if self.transformer.embeddings.hybrid:
                 self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(np2th(weights["conv_root/kernel"], conv=True))
