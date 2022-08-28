@@ -19,6 +19,7 @@ from torch.nn.modules.utils import _pair
 from scipy import ndimage
 
 import models.configs as configs
+from utils.drop_and_restore_utils import apply_chunking_to_forward
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,11 @@ def np2th(weights, conv=False):
 
 def swish(x):
     return x * torch.sigmoid(x)
+
+def expand_gather(input, dim, index):
+    size = list(input.size())
+    size[dim] = -1
+    return input.gather(dim, index.expand(*size))
 
 ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "swish": swish}
 
@@ -184,17 +190,27 @@ class Block(nn.Module):
         self.ffn = Mlp(config)
         self.attn = Attention(config, vis)
 
-    def forward(self, x):
+    def forward(self, x, output_length=None):
         h = x
         x = self.attention_norm(x)
         x, weights = self.attn(x)
         x = x + h
 
+        if output_length is not None:
+            significance_score = weights.sum(2).sum(1)
+            keep_indices = significance_score[:, 1:].topk(output_length - 1, 1)[1] + 1
+            cls_index = keep_indices.new_zeros((keep_indices.size(0), 1))
+            keep_indices = torch.cat((cls_index, keep_indices), 1)
+            x = expand_gather(x, 1, keep_indices.unsqueeze(-1))
+        else:
+            keep_indices = None
+
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
+        #x = apply_chunking_to_forward(self.ffn, 0, 1, x)
         x = x + h
-        return x, weights
+        return x, keep_indices
 
     def load_from(self, weights, n_block):
         ROOT = f"Transformer/encoderblock_{n_block}"
@@ -257,14 +273,27 @@ class Encoder(nn.Module):
             layer = Block(config, vis)
             self.layer.append(copy.deepcopy(layer))
 
-    def forward(self, hidden_states):
-        attn_weights = []
-        for layer_block in self.layer:
-            hidden_states, weights = layer_block(hidden_states)
-            if self.vis:
-                attn_weights.append(weights)
-        encoded = self.encoder_norm(hidden_states)
-        return encoded, attn_weights
+    def forward(self, hidden_states, layer_config, length_config):
+        bsz, tsz, dim = hidden_states.size()
+
+        if length_config is not None:
+            restored_hidden_states = hidden_states
+            remain_indices = torch.arange(tsz, device=hidden_states.device).unsqueeze(0).repeat(bsz, 1)
+
+        for i, layer_block in enumerate(self.layer):
+            if layer_config is not None and i not in layer_config:
+                continue
+            
+            layer_output_length = length_config[i] if length_config is not None else None
+            hidden_states, keep_indices = layer_block(hidden_states, output_length=layer_output_length)
+            
+            if layer_output_length:
+                remain_indices = remain_indices.gather(1, keep_indices)
+                restored_hidden_states = restored_hidden_states.scatter(1, remain_indices.unsqueeze(-1).expand(-1, -1, dim), hidden_states)
+
+        last_hidden_state = restored_hidden_states if length_config is not None else hidden_states
+        encoded = self.encoder_norm(last_hidden_state)
+        return encoded
 
 class Transformer(nn.Module):
     def __init__(self, config, img_size, vis):
@@ -272,10 +301,10 @@ class Transformer(nn.Module):
         self.embeddings = Embeddings(config, img_size=img_size)
         self.encoder = Encoder(config, vis)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, layer_config, length_config):
         embedding_output = self.embeddings(input_ids)
-        encoded, attn_weights = self.encoder(embedding_output)
-        return encoded, attn_weights
+        encoded = self.encoder(embedding_output, layer_config, length_config)
+        return encoded
 
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
@@ -287,8 +316,14 @@ class VisionTransformer(nn.Module):
         self.transformer = Transformer(config, img_size, vis)
         self.head = Linear(config.hidden_size, num_classes)
 
-    def forward(self, x, labels=None):
-        x, attn_weights = self.transformer(x)
+    def forward(
+        self, 
+        x, 
+        labels=None,
+        layer_config=None,
+        length_config=None,
+        ):
+        x = self.transformer(x, layer_config, length_config)
         logits = self.head(x[:, 0])
 
         if labels is not None:
@@ -296,7 +331,7 @@ class VisionTransformer(nn.Module):
             loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
             return loss, logits
         else:
-            return logits, attn_weights
+            return logits
 
     def load_from(self, weights):
         with torch.no_grad():

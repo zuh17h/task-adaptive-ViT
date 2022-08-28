@@ -15,6 +15,8 @@ import torch.distributed as dist
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn import KLDivLoss
+import torch.nn.functional as F
 from apex import amp
 from apex.parallel import DistributedDataParallel as DDP
 
@@ -22,6 +24,12 @@ from models.modeling import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader
 from utils.dist_util import get_world_size
+from utils.drop_and_restore_utils import (
+    sample_length_configuration,
+    sample_head_configuration,
+    sample_layer_configuration,
+    what_to_prune,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +301,181 @@ def train(args, model):
     end_time = time.time()
     logger.info("Total Training Time: \t%f" % ((end_time - start_time) / 3600))
 
+def distil(args, model):
+    """ Train the model """
+    if args.local_rank in [-1, 0]:
+        os.makedirs(args.output_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
+
+    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+
+    # Prepare dataset
+    train_loader, test_loader = get_loader(args)
+
+    # Prepare optimizer and scheduler
+    optimizer = torch.optim.SGD(model.parameters(),
+                                lr=args.learning_rate,
+                                momentum=0.9,
+                                weight_decay=args.weight_decay)
+    t_total = args.num_steps
+    if args.decay_type == "cosine":
+        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+    else:
+        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+
+    if args.fp16:
+        model, optimizer = amp.initialize(models=model,
+                                          optimizers=optimizer,
+                                          opt_level=args.fp16_opt_level)
+        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+
+    # Distributed training
+    if args.local_rank != -1:
+        model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size(), delay_allreduce=True)
+
+    # Train!
+    logger.info("***** Running training *****")
+    logger.info("  Total optimization steps = %d", args.num_steps)
+    logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
+    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+                args.train_batch_size * args.gradient_accumulation_steps * (
+                    torch.distributed.get_world_size() if args.local_rank != -1 else 1))
+    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+
+    model.zero_grad()
+    set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
+    losses = AverageMeter()
+    global_step, best_acc = 0, 0
+    start_time = time.time()
+    while True:
+        model.train()
+        epoch_iterator = tqdm(train_loader,
+                              desc="Training (X / X Steps) (loss=X.X)",
+                              bar_format="{l_bar}{r_bar}",
+                              dynamic_ncols=True,
+                              disable=args.local_rank not in [-1, 0])
+        all_preds, all_label = [], []
+        for step, batch in enumerate(epoch_iterator):
+            batch = tuple(t.to(args.device) for t in batch)
+            x, y = batch
+
+            inputs = {
+                "x": x,
+                "labels": y,
+            }
+
+            layer_config = sample_layer_configuration(
+                args.num_model_layer,
+                layer_dropout_prob=args.layer_dropout_prob,
+                layer_dropout=0,
+            )
+
+            inputs["layer_config"] = layer_config
+            inputs["length_config"] = None
+
+            loss, logits = model(**inputs)
+            loss = loss + 0 * sum([x.sum() for x in model.parameters()])
+            loss = loss.mean()
+            loss = loss / (args.num_sandwich + 2)
+            if args.fp16:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+                
+            for i in range(args.num_sandwich + 1):
+                t_logits = logits.detach()
+
+                layer_config = sample_layer_configuration(
+                    args.num_model_layer,
+                    layer_dropout_prob=args.layer_dropout_prob,
+                    layer_dropout=(args.layer_dropout_bound if i == 0 else None),
+                    layer_dropout_bound=args.layer_dropout_bound,
+                )
+                inputs["layer_config"] = layer_config
+
+                length_config = sample_length_configuration(
+                    args.max_seq_length,
+                    args.num_model_layer,
+                    layer_config,
+                    length_drop_ratio=(args.length_drop_ratio_bound if i == 0 else None),
+                    length_drop_ratio_bound=args.length_drop_ratio_bound,
+                )
+                inputs["length_config"] = length_config
+
+                sub_loss, sub_logits = model(**inputs)
+                sub_loss = sub_loss.mean()
+
+                loss_fct = KLDivLoss(reduction="batchmean")
+                loss = loss_fct(F.log_softmax(t_logits, -1), F.softmax(sub_logits, -1))
+                loss = loss / (args.num_sandwich + 2)
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+                if args.fp16:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
+
+            preds = torch.argmax(logits, dim=-1)
+
+            if len(all_preds) == 0:
+                all_preds.append(preds.detach().cpu().numpy())
+                all_label.append(y.detach().cpu().numpy())
+            else:
+                all_preds[0] = np.append(
+                    all_preds[0], preds.detach().cpu().numpy(), axis=0
+                )
+                all_label[0] = np.append(
+                    all_label[0], y.detach().cpu().numpy(), axis=0
+                )
+
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                losses.update(loss.item()*args.gradient_accumulation_steps)
+                if args.fp16:
+                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                scheduler.step()
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+                epoch_iterator.set_description(
+                    "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, losses.val)
+                )
+                if args.local_rank in [-1, 0]:
+                    writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
+                    writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                if global_step % args.eval_every == 0:
+                    with torch.no_grad():
+                        accuracy = valid(args, model, writer, test_loader, global_step)
+                    if args.local_rank in [-1, 0]:
+                        if best_acc < accuracy:
+                            save_model(args, model)
+                            best_acc = accuracy
+                        logger.info("best accuracy so far: %f" % best_acc)
+                    model.train()
+
+                if global_step % t_total == 0:
+                    break
+        all_preds, all_label = all_preds[0], all_label[0]
+        accuracy = simple_accuracy(all_preds, all_label)
+        accuracy = torch.tensor(accuracy).to(args.device)
+        dist.barrier()
+        train_accuracy = reduce_mean(accuracy, args.nprocs)
+        train_accuracy = train_accuracy.detach().cpu().numpy()
+        logger.info("train accuracy so far: %f" % train_accuracy)
+        losses.reset()
+        if global_step % t_total == 0:
+            break
+
+    writer.close()
+    logger.info("Best Accuracy: \t%f" % best_acc)
+    logger.info("End Training!")
+    end_time = time.time()
+    logger.info("Total Training Time: \t%f" % ((end_time - start_time) / 3600))
+
 def main():
     parser = argparse.ArgumentParser()
     # Required parameters
@@ -358,6 +541,19 @@ def main():
     parser.add_argument('--slide_step', type=int, default=12,
                         help="Slide step for overlap split")
 
+    parser.add_argument('--num_sandwich', type=int, default=2,
+                        help="number of sandwiches\n")
+    parser.add_argument('--length_drop_ratio_bound', type=float, default=0.2,
+                        help="length drop ratio bound\n")
+    parser.add_argument('--layer_dropout_prob', type=float, default=0.2,
+                        help="layer dropout prob\n")
+    parser.add_argument('--layer_dropout_bound', type=int, default=0,
+                        help="layer dropout bound\n")
+    parser.add_argument('--max_seq_length', type=int, default=785,
+                        help="layer dropout bound\n")
+    parser.add_argument('--num_model_layer', type=int, default=12,
+                        help="layer number\n")
+
     args = parser.parse_args()
 
     # if args.fp16 and args.smoothing_value != 0:
@@ -389,7 +585,7 @@ def main():
     # Model & Tokenizer Setup
     args, model = setup(args)
     # Training
-    train(args, model)
+    distil(args, model)
 
 if __name__ == "__main__":
     main()
