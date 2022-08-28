@@ -105,7 +105,7 @@ class Attention(nn.Module):
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         attention_probs = self.softmax(attention_scores)
-        weights = attention_probs
+        weights = attention_probs if self.vis else None
         attention_probs = self.attn_dropout(attention_probs)
 
         context_layer = torch.matmul(attention_probs, value_layer)
@@ -386,7 +386,7 @@ class VisionTransformer(nn.Module):
 
                 for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
                     for uname, unit in block.named_children():
-                        unit.load_from(weights, n_block=bname, n_unit=uname) 
+                        unit.load_from(weights, n_block=bname, n_unit=uname)
 
 def con_loss(features, labels):
     B, _ = features.shape
