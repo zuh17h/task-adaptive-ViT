@@ -276,7 +276,7 @@ def train(args, model):
                     with torch.no_grad():
                         accuracy = valid(args, model, writer, test_loader, global_step)
                     if args.local_rank in [-1, 0]:
-                        if best_acc < accuracy:
+                        if round(best_acc, 3) <= round(accuracy, 3):
                             save_model(args, model)
                             best_acc = accuracy
                         logger.info("best accuracy so far: %f" % best_acc)
