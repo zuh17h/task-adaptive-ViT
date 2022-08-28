@@ -7,6 +7,7 @@ import os
 import random
 import numpy as np
 import time
+import math
 
 from datetime import timedelta
 
@@ -276,7 +277,7 @@ def train(args, model):
                     with torch.no_grad():
                         accuracy = valid(args, model, writer, test_loader, global_step)
                     if args.local_rank in [-1, 0]:
-                        if round(best_acc, 3) <= round(accuracy, 3):
+                        if math.floor(best_acc*1000) / 1000 <= math.floor(accuracy*1000) / 1000:
                             save_model(args, model)
                             best_acc = accuracy
                         logger.info("best accuracy so far: %f" % best_acc)
