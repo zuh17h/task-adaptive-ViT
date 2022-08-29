@@ -31,6 +31,7 @@ from utils.drop_and_restore_utils import (
     sample_layer_configuration,
     what_to_prune,
 )
+from utils.evolution import Evolution
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +278,7 @@ def train(args, model):
                     with torch.no_grad():
                         accuracy = valid(args, model, writer, test_loader, global_step)
                     if args.local_rank in [-1, 0]:
-                        if math.floor(best_acc*1000) / 1000 <= math.floor(accuracy*1000) / 1000:
+                        if best_acc < accuracy:
                             save_model(args, model)
                             best_acc = accuracy
                         logger.info("best accuracy so far: %f" % best_acc)
@@ -452,7 +453,7 @@ def distil(args, model):
                     with torch.no_grad():
                         accuracy = valid(args, model, writer, test_loader, global_step)
                     if args.local_rank in [-1, 0]:
-                        if best_acc < accuracy:
+                        if math.floor(best_acc*1000) / 1000 <= math.floor(accuracy*1000) / 1000:
                             save_model(args, model)
                             best_acc = accuracy
                         logger.info("best accuracy so far: %f" % best_acc)
@@ -476,6 +477,55 @@ def distil(args, model):
     logger.info("End Training!")
     end_time = time.time()
     logger.info("Total Training Time: \t%f" % ((end_time - start_time) / 3600))
+
+def evaluate(args, model, test_loader):
+    # Validation!
+    eval_losses = AverageMeter()
+
+    logger.info("***** Running Validation *****")
+    logger.info("  Num steps = %d", len(test_loader))
+    logger.info("  Batch size = %d", args.eval_batch_size)
+
+    model.eval()
+    all_preds, all_label = [], []
+    epoch_iterator = tqdm(test_loader,
+                          desc="Validating... (loss=X.X)",
+                          bar_format="{l_bar}{r_bar}",
+                          dynamic_ncols=True,
+                          disable=args.local_rank not in [-1, 0])
+    loss_fct = torch.nn.CrossEntropyLoss()
+    for step, batch in enumerate(epoch_iterator):
+        batch = tuple(t.to(args.device) for t in batch)
+        x, y = batch
+        with torch.no_grad():
+            logits = model(x)
+
+            eval_loss = loss_fct(logits, y)
+            eval_loss = eval_loss.mean()
+            eval_losses.update(eval_loss.item())
+
+            preds = torch.argmax(logits, dim=-1)
+
+        if len(all_preds) == 0:
+            all_preds.append(preds.detach().cpu().numpy())
+            all_label.append(y.detach().cpu().numpy())
+        else:
+            all_preds[0] = np.append(
+                all_preds[0], preds.detach().cpu().numpy(), axis=0
+            )
+            all_label[0] = np.append(
+                all_label[0], y.detach().cpu().numpy(), axis=0
+            )
+        epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
+
+    all_preds, all_label = all_preds[0], all_label[0]
+    accuracy = simple_accuracy(all_preds, all_label)
+    accuracy = torch.tensor(accuracy).to(args.device)
+    dist.barrier()
+    val_accuracy = reduce_mean(accuracy, args.nprocs)
+    val_accuracy = val_accuracy.detach().cpu().numpy()
+        
+    return val_accuracy
 
 def main():
     parser = argparse.ArgumentParser()
