@@ -31,7 +31,7 @@ from utils.drop_and_restore_utils import (
     sample_layer_configuration,
     what_to_prune,
 )
-from utils.evolution import Evolution
+from utils.evolution import Evolution, inverse, approx_ratio, store2str
 
 logger = logging.getLogger(__name__)
 
@@ -482,10 +482,6 @@ def evaluate(args, model, test_loader):
     # Validation!
     eval_losses = AverageMeter()
 
-    logger.info("***** Running Validation *****")
-    logger.info("  Num steps = %d", len(test_loader))
-    logger.info("  Batch size = %d", args.eval_batch_size)
-
     model.eval()
     all_preds, all_label = [], []
     epoch_iterator = tqdm(test_loader,
@@ -524,6 +520,7 @@ def evaluate(args, model, test_loader):
     dist.barrier()
     val_accuracy = reduce_mean(accuracy, args.nprocs)
     val_accuracy = val_accuracy.detach().cpu().numpy()
+    #val_accuracy = accuracy.detach().cpu().numpy()
         
     return val_accuracy
 
@@ -604,6 +601,23 @@ def main():
                         help="layer dropout bound\n")
     parser.add_argument('--num_model_layer', type=int, default=12,
                         help="layer number\n")
+    parser.add_argument("--do_search", action="store_true", 
+                        help="do evo search")
+    parser.add_argument("--do_distil", action="store_true", 
+                        help="do evo search")
+    parser.add_argument("--evo_path", type=str, default="./evo",
+                        help="Where to search for evo results.")
+
+    parser.add_argument('--population_size', type=int, default=20,
+                        help="evo search population size\n")
+    parser.add_argument('--mutation_prob', type=float, default=0.5,
+                        help="evo search population size\n")
+    parser.add_argument('--mutation_size', type=int, default=30,
+                        help="evo search population size\n")
+    parser.add_argument('--crossover_size', type=int, default=30,
+                        help="evo search population size\n")
+    parser.add_argument('--evo_iter', type=int, default=30,
+                        help="evo search population size\n")
 
     args = parser.parse_args()
 
@@ -636,7 +650,64 @@ def main():
     # Model & Tokenizer Setup
     args, model = setup(args)
     # Training
-    distil(args, model)
+    if args.do_distil:
+        distil(args, model)
+
+    if args.do_search:
+        if args.local_rank != -1:
+            model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        _, test_loader = get_loader(args)
+        evolution = Evolution(model, args, evaluate, test_loader)
+        evolution.load_store(os.path.join(args.evo_path, args.name, 'store.tsv'))
+        if not os.path.exists(os.path.join(args.evo_path, args.name)):
+            os.makedirs(os.path.join(args.evo_path, args.name))
+
+        lower_gene = sample_length_configuration(
+            args.max_seq_length,
+            args.num_model_layer,
+            length_drop_ratio=args.length_drop_ratio_bound,
+        )
+        upper_gene = (args.max_seq_length,) * args.num_model_layer
+        evolution.add_gene(lower_gene, method=0)
+        evolution.add_gene(upper_gene, method=0)
+        evolution.lower_constraint = evolution.store[lower_gene][0]
+        evolution.upper_constraint = evolution.store[upper_gene][0]
+
+        length_drop_ratios = [inverse(r) for r in np.linspace(approx_ratio(args.length_drop_ratio_bound), 1, args.population_size + 2)[1:-1]]
+        for p in length_drop_ratios:
+            gene = sample_length_configuration(
+                args.max_seq_length,
+                args.num_model_layer,
+                length_drop_ratio=p,
+            )
+            evolution.add_gene(gene, method=0)
+
+        for i in range(args.evo_iter + 1):
+            logger.info(f"| Start Iteration {i}:")
+            population, area = evolution.pareto_frontier()
+            parents = evolution.convex_hull()
+            results = {"area": area, "population_size": len(population), "num_parents": len(parents)}
+
+            logger.info(f"| >>>>>>>> {' | '.join([f'{k} {v}' for k, v in results.items()])}")
+            for gene in parents:  # population
+                logger.info("| " + store2str(gene, *evolution.store[gene][:3]))
+
+            evolution.save_store(os.path.join(args.evo_path, args.name, f'store-iter{i}.tsv'))
+            evolution.save_population(os.path.join(args.evo_path, args.name, f'population-iter{i}.tsv'), population)
+            evolution.save_population(os.path.join(args.evo_path, args.name, f'parents-iter{i}.tsv'), parents)
+
+            if i == args.evo_iter:
+                break
+
+            k = 0
+            while k < args.mutation_size:
+                if evolution.mutate(args.mutation_prob):
+                    k += 1
+
+            k = 0
+            while k < args.crossover_size:
+                if evolution.crossover():
+                    k += 1
 
 if __name__ == "__main__":
     main()

@@ -316,6 +316,11 @@ class VisionTransformer(nn.Module):
         self.transformer = Transformer(config, img_size, vis)
         self.head = Linear(config.hidden_size, num_classes)
 
+        self.length_config = None
+
+    def set_length_config(self, length_config):
+        self.length_config = length_config
+
     def forward(
         self, 
         x, 
@@ -323,7 +328,7 @@ class VisionTransformer(nn.Module):
         layer_config=None,
         length_config=None,
         ):
-        x = self.transformer(x, layer_config, length_config)
+        x = self.transformer(x, layer_config, length_config if length_config is not None else self.length_config)
         logits = self.head(x[:, 0])
 
         if labels is not None:

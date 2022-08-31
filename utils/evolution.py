@@ -57,11 +57,9 @@ class Evolution(object):
         self.evaluate = evaluate
         self.test_loader = test_loader
 
-        size = (1, self.args.max_seq_length)
+        size = (8, 3, args.img_size, args.img_size)
         self.dummy_inputs = (
-            torch.ones(size, dtype=torch.long).to(self.args.device),
-            torch.ones(size, dtype=torch.long).to(self.args.device),
-            torch.zeros(size, dtype=torch.long).to(self.args.device),
+            torch.ones(size, dtype=torch.float).to(self.args.device)
         )
 
         self.lower_constraint = lower_constraint
@@ -130,11 +128,14 @@ class Evolution(object):
     def add_gene(self, gene, macs=None, score=None, method=0, parents=None):
         if gene not in self.store:
             self.model.eval()
-            self.model.set_length_config(gene)
+            if hasattr(self.model, "module"):
+                self.model.module.set_length_config(gene)
+            else:
+                self.model.set_length_config(gene)
             macs = macs or torchprofile.profile_macs(self.model, args=self.dummy_inputs)
             if macs < self.lower_constraint:
                 return False
-            score = score or self.evaluate(self.args, self.model, self.tokenizer)[0]['f1']
+            score = score or self.evaluate(self.args, self.model, self.test_loader)
             self.store[gene] = (macs, score, method, parents)
             logger.info(store2str(gene, macs, score, method, parents))
 
@@ -149,10 +150,10 @@ class Evolution(object):
     def mutate(self, mutation_prob):
         gene = random.choice(self.population)
         mutated_gene = ()
-        for i in range(self.model.config.num_hidden_layers):
+        for i in range(self.args.num_model_layer):
             if np.random.uniform() < mutation_prob:
                 prev = (self.args.max_seq_length if i == 0 else mutated_gene[i - 1])
-                next = (2 if i == self.model.config.num_hidden_layers - 1 else gene[i + 1])
+                next = (2 if i == self.args.num_model_layer - 1 else gene[i + 1])
                 mutated_gene += (random.randrange(next, prev + 1),)
             else:
                 mutated_gene += (gene[i],)
