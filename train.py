@@ -467,7 +467,7 @@ def distil(args, model):
         dist.barrier()
         train_accuracy = reduce_mean(accuracy, args.nprocs)
         train_accuracy = train_accuracy.detach().cpu().numpy()
-        logger.info("train accuracy so far: %f" % train_accuracy)
+        logger.info("single epoch train accuracy so far: %f" % train_accuracy)
         losses.reset()
         if global_step % t_total == 0:
             break
