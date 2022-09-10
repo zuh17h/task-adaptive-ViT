@@ -357,6 +357,7 @@ def distil(args, model):
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
         all_preds, all_label = [], []
+        epoch = 0
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
@@ -453,7 +454,7 @@ def distil(args, model):
                     with torch.no_grad():
                         accuracy = valid(args, model, writer, test_loader, global_step)
                     if args.local_rank in [-1, 0]:
-                        if math.floor(best_acc*1000) / 1000 <= math.floor(accuracy*1000) / 1000:
+                        if math.floor(best_acc*1000) / 1000 <= math.floor(accuracy*1000) / 1000 and epoch != 0:
                             save_model(args, model)
                             best_acc = accuracy
                         logger.info("best accuracy so far: %f" % best_acc)
@@ -461,6 +462,8 @@ def distil(args, model):
 
                 if global_step % t_total == 0:
                     break
+
+        epoch += 1
         all_preds, all_label = all_preds[0], all_label[0]
         accuracy = simple_accuracy(all_preds, all_label)
         accuracy = torch.tensor(accuracy).to(args.device)
