@@ -349,6 +349,7 @@ def distil(args, model):
     losses = AverageMeter()
     global_step, best_acc = 0, 0
     start_time = time.time()
+    epoch = 0
     while True:
         model.train()
         epoch_iterator = tqdm(train_loader,
@@ -357,7 +358,6 @@ def distil(args, model):
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
         all_preds, all_label = [], []
-        epoch = 0
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
