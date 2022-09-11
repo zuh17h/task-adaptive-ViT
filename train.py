@@ -305,7 +305,7 @@ def main():
                                                  "ViT-L_32", "ViT-H_14"],
                         default="ViT-B_16",
                         help="Which variant to use.")
-    parser.add_argument("--pretrained_dir", type=str, default="./pretrained",
+    parser.add_argument("--pretrained_dir", type=str, default="./pretrained/ViT-B_16.npz",
                         help="Where to search for pretrained ViT models.")
     parser.add_argument("--pretrained_model", type=str, default=None,
                         help="load pretrained model")
