@@ -13,6 +13,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+import torchprofile
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
@@ -439,6 +440,9 @@ def main():
         reporter = MemReporter(model)
         output = model(dummy_inputs)
         reporter.report()
+
+        mac = torchprofile.profile_macs(model, args=dummy_inputs)
+        print("MACs: ", mac)
         
         evalTime = latency(args, model, test_loader)
         print('Evaluation done in total {:.3f} secs ({:.3f} sec per example)'.format(evalTime, evalTime / len(test_loader)))
