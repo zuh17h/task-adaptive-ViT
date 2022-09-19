@@ -7,6 +7,7 @@ import os
 import random
 import numpy as np
 import time
+import timeit
 
 from datetime import timedelta
 
@@ -293,6 +294,26 @@ def train(args, model):
     end_time = time.time()
     logger.info("Total Training Time: \t%f" % ((end_time - start_time) / 3600))
 
+def latency(args, model, test_loader):
+    # Validation!
+    eval_losses = AverageMeter()
+
+    model.eval()
+    all_preds, all_label = [], []
+    epoch_iterator = tqdm(test_loader,
+                          desc="Validating... (loss=X.X)",
+                          bar_format="{l_bar}{r_bar}",
+                          dynamic_ncols=True,
+                          disable=args.local_rank not in [-1, 0])
+    loss_fct = torch.nn.CrossEntropyLoss()
+    start_time = timeit.default_timer()
+    for step, batch in enumerate(epoch_iterator):
+        batch = tuple(t.to(args.device) for t in batch)
+        x, y = batch
+        with torch.no_grad():
+            logits = model(x)
+    evalTime = timeit.default_timer() - start_time
+
 def main():
     parser = argparse.ArgumentParser()
     # Required parameters
@@ -358,6 +379,9 @@ def main():
     parser.add_argument('--slide_step', type=int, default=12,
                         help="Slide step for overlap split")
 
+    parser.add_argument("--do_lat_mem_measure", action="store_true", 
+                        help="do evo search")
+
     args = parser.parse_args()
 
     # if args.fp16 and args.smoothing_value != 0:
@@ -389,7 +413,33 @@ def main():
     # Model & Tokenizer Setup
     args, model = setup(args)
     # Training
-    train(args, model)
+    #train(args, model)
+    if args.do_lat_mem_measure:
+        if args.local_rank != -1:
+            model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        _, test_loader = get_loader(args)
+        from pytorch_memlab import MemReporter
+        size = (8, 3, args.img_size, args.img_size)
+        dummy_inputs = (
+            torch.ones(size, dtype=torch.float).to(args.device)
+        )
+
+        param_size = 0
+        for param in model.parameters():
+            param_size += param.nelement() * param.element_size()
+        buffer_size = 0
+        for buffer in model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+
+        size_all_mb = (param_size + buffer_size) / 1024**2
+        print('model size: {:.3f}MB'.format(size_all_mb))
+
+        reporter = MemReporter(model)
+        output = model(dummy_inputs)
+        reporter.report()
+        
+        evalTime = latency(args, model, test_loader)
+        print('Evaluation done in total {:.3f} secs ({:.3f} sec per example)'.format(evalTime, evalTime / len(test_loader)))
 
 if __name__ == "__main__":
     main()
