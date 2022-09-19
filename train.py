@@ -384,6 +384,8 @@ def main():
 
     parser.add_argument("--do_lat_mem_measure", action="store_true", 
                         help="do evo search")
+    parser.add_argument("--do_mac", action="store_true", 
+                        help="do evo search")
 
     args = parser.parse_args()
 
@@ -441,11 +443,23 @@ def main():
         output = model(dummy_inputs)
         reporter.report()
 
-        mac = torchprofile.profile_macs(model, args=dummy_inputs)
-        print("MACs: ", mac)
+        # mac = torchprofile.profile_macs(model, args=dummy_inputs)
+        # print("MACs: ", mac)
         
         evalTime = latency(args, model, test_loader)
         print('Evaluation done in total {:.3f} secs ({:.3f} sec per example)'.format(evalTime, evalTime / len(test_loader)))
+
+    if args.do_mac:
+        if args.local_rank != -1:
+            model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        _, test_loader = get_loader(args)
+        size = (8, 3, args.img_size, args.img_size)
+        dummy_inputs = (
+            torch.ones(size, dtype=torch.float).to(args.device)
+        )
+        mac = torchprofile.profile_macs(model, args=dummy_inputs)
+        print("MACs: ", mac)
+
 
 if __name__ == "__main__":
     main()
