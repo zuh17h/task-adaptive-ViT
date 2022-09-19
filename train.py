@@ -314,6 +314,8 @@ def latency(args, model, test_loader):
             logits = model(x)
     evalTime = timeit.default_timer() - start_time
 
+    return evalTime
+
 def main():
     parser = argparse.ArgumentParser()
     # Required parameters
