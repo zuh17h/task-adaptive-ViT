@@ -268,7 +268,7 @@ class Encoder(nn.Module):
     def forward(self, hidden_states, memories=None,attn_mask=None):
         attn_weights = []
         for i, layer in enumerate(self.layer):
-            hidden_states, weights = layer(hidden_states, memories[i,:,:] if memories is not None else None, attn_mask)
+            hidden_states, weights = layer(hidden_states, memories[i] if memories is not None else None, attn_mask)
             attn_weights.append(weights)
         encoded = self.norm(hidden_states)         
         return encoded
@@ -389,7 +389,7 @@ class Adaptor(nn.Module):
         if labels is not None:
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
-            
+
             return loss, logits
         else:
             return logits
