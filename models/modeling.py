@@ -256,20 +256,6 @@ class Block(nn.Module):
             self.ffn_norm.weight.copy_(np2th(weights[pjoin(ROOT, MLP_NORM, "scale")]))
             self.ffn_norm.bias.copy_(np2th(weights[pjoin(ROOT, MLP_NORM, "bias")]))
 
-class Part_Attention(nn.Module):
-    def __init__(self):
-        super(Part_Attention, self).__init__()
-
-    def forward(self, x):
-        length = len(x)
-        last_map = x[0]
-        for i in range(1, length):
-            last_map = torch.matmul(x[i], last_map)
-
-        last_map = last_map[:,:,0,1:]
-        _, max_inx = last_map.max(2)
-        return _, max_inx
-
 class Encoder(nn.Module):
     def __init__(self, config):
         super(Encoder, self).__init__()
@@ -277,38 +263,16 @@ class Encoder(nn.Module):
         for _ in range(config.transformer["num_layers"] - 1):
             layer = Block(config)
             self.layer.append(copy.deepcopy(layer))
-        self.part_select = Part_Attention()
-        self.part_layer = Block(config)
-        self.part_norm = LayerNorm(config.hidden_size, eps=1e-6)
+        self.norm = LayerNorm(config.hidden_size, eps=1e-6)
 
     def forward(self, hidden_states, memories=None,attn_mask=None):
         attn_weights = []
         for i, layer in enumerate(self.layer):
             hidden_states, weights = layer(hidden_states, memories[i,:,:] if memories is not None else None, attn_mask)
             attn_weights.append(weights)
-        part_encoded = self.part_norm(hidden_states)       
-        # part_num, part_inx = self.part_select(attn_weights)
-        # part_inx = part_inx + 1
-        # parts = []
-        # B, num = part_inx.shape
-        # for i in range(B):
-        #     parts.append(hidden_states[i, part_inx[i,:]])
-        # parts = torch.stack(parts).squeeze(1)
-        # concat = torch.cat((hidden_states[:,0].unsqueeze(1), parts), dim=1)
-        # part_states, part_weights = self.part_layer(concat, memories)
-        # part_encoded = self.part_norm(part_states)   
-        return part_encoded
+        encoded = self.norm(hidden_states)         
+        return encoded
 
-# class Transformer(nn.Module):
-#     def __init__(self, config, img_size):
-#         super(Transformer, self).__init__()
-#         self.embeddings = Embeddings(config, img_size=img_size)
-#         self.encoder = Encoder(config)
-
-#     def forward(self, input_ids):
-#         embedding_output = self.embeddings(input_ids)
-#         part_encoded = self.encoder(embedding_output)
-#         return part_encoded
 class Transformer(nn.Module):
     def __init__(self, config, img_size):
         super(Transformer, self).__init__()
@@ -401,10 +365,8 @@ class Adaptor(nn.Module):
         
         dim = config.hidden_size
         self.vit = vit
-        # num_patches = 626
         num_patches = vit.transformer.embeddings.n_patches+1
-        # num_patches = 197
-        # vit.pos_embedding.shape[-2]
+       
         self.num_classes = num_classes
         self.task_head = nn.Sequential(
             nn.LayerNorm(dim),
@@ -427,8 +389,7 @@ class Adaptor(nn.Module):
         if labels is not None:
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
-            #contrast_loss = con_loss(x[:, 0], labels.view(-1))
-            #loss = ce_loss + contrast_loss
+            
             return loss, logits
         else:
             return logits
