@@ -4,7 +4,7 @@ import os
 
 import torch
 
-from torchvision import transforms
+from torchvision import transforms, datasets
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
 
 from .dataset import CUB, CarsDataset, NABirds, dogs, INat2017
@@ -66,13 +66,13 @@ def get_loader(args):
                                 train=True,
                                 cropped=False,
                                 transform=train_transform,
-                                download=False
+                                download=True
                                 )
         testset = dogs(root=args.data_root,
                                 train=False,
                                 cropped=False,
                                 transform=test_transform,
-                                download=False
+                                download=True
                                 )
     elif args.dataset == 'nabirds':
         train_transform=transforms.Compose([transforms.Resize((600, 600), Image.BILINEAR),
@@ -99,7 +99,27 @@ def get_loader(args):
                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
         trainset = INat2017(args.data_root, 'train', train_transform)
         testset = INat2017(args.data_root, 'val', test_transform)
+    elif args.dataset == 'Cifar100':
+        transform_train = transforms.Compose([
+            transforms.RandomResizedCrop((args.img_size, args.img_size), scale=(0.05, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+        transform_test = transforms.Compose([
+            transforms.Resize((args.img_size, args.img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
 
+        trainset = datasets.CIFAR100(root=args.data_root,
+                                     train=True,
+                                     download=True,
+                                     transform=transform_train)
+        testset = datasets.CIFAR100(root=args.data_root,
+                                    train=False,
+                                    download=True,
+                                    transform=transform_test) 
     if args.local_rank == 0:
         torch.distributed.barrier()
 

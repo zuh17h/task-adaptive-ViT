@@ -2,7 +2,9 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
+import os
+import sys
+sys.path.append(os.getcwd())
 import copy
 import logging
 import math
@@ -30,6 +32,16 @@ FC_0 = "MlpBlock_3/Dense_0"
 FC_1 = "MlpBlock_3/Dense_1"
 ATTENTION_NORM = "LayerNorm_0"
 MLP_NORM = "LayerNorm_2"
+
+def exists(val):
+    return val is not None
+
+def set_module_requires_grad_(module, requires_grad):
+    for param in module.parameters():
+        param.requires_grad = requires_grad
+
+def freeze_all_layers_(module):
+    set_module_requires_grad_(module, False)
 
 def np2th(weights, conv=False):
     """Possibly convert HWIO to OIHW."""
@@ -86,10 +98,17 @@ class Attention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, memories=None, attn_mask=None):
+
+        kv_hidden_states = hidden_states
+
+        if exists(memories):
+            memories = memories.expand(hidden_states.shape[0], -1, -1)
+            kv_hidden_states = torch.cat((kv_hidden_states, memories), dim=1)
+         
         mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+        mixed_key_layer = self.key(kv_hidden_states)
+        mixed_value_layer = self.value(kv_hidden_states)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -97,6 +116,10 @@ class Attention(nn.Module):
 
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+
+        if exists(attn_mask):
+            attention_scores = attention_scores.masked_fill(~attn_mask, -torch.finfo(attention_scores.dtype).max)
+
         attention_probs = self.softmax(attention_scores)
         weights = attention_probs
         attention_probs = self.attn_dropout(attention_probs)
@@ -143,35 +166,37 @@ class Embeddings(nn.Module):
 
         patch_size = _pair(config.patches["size"])
         if config.split == 'non-overlap':
-            n_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
+            self.n_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
             self.patch_embeddings = Conv2d(in_channels=in_channels,
                                        out_channels=config.hidden_size,
                                        kernel_size=patch_size,
                                        stride=patch_size)
         elif config.split == 'overlap':
-            n_patches = ((img_size[0] - patch_size[0]) // config.slide_step + 1) * ((img_size[1] - patch_size[1]) // config.slide_step + 1)
+            self.n_patches = ((img_size[0] - patch_size[0]) // config.slide_step + 1) * ((img_size[1] - patch_size[1]) // config.slide_step + 1)
             self.patch_embeddings = Conv2d(in_channels=in_channels,
                                         out_channels=config.hidden_size,
                                         kernel_size=patch_size,
                                         stride=(config.slide_step, config.slide_step))
-        self.position_embeddings = nn.Parameter(torch.zeros(1, n_patches+1, config.hidden_size))
+        print("number of patches", self.n_patches)
+        self.position_embeddings = nn.Parameter(torch.zeros(1, self.n_patches+1, config.hidden_size))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
 
         self.dropout = Dropout(config.transformer["dropout_rate"])
 
-    def forward(self, x):
+    def forward(self, x, mem_cls=None):
         B = x.shape[0]
         cls_tokens = self.cls_token.expand(B, -1, -1)
-
         if self.hybrid:
             x = self.hybrid_model(x)
         x = self.patch_embeddings(x)
         x = x.flatten(2)
         x = x.transpose(-1, -2)
         x = torch.cat((cls_tokens, x), dim=1)
-
         embeddings = x + self.position_embeddings
         embeddings = self.dropout(embeddings)
+        if exists(mem_cls):
+            mem_cls_token = mem_cls.expand(B, -1, -1)
+            embeddings = torch.cat((mem_cls_token, embeddings), dim=1)
         return embeddings
 
 class Block(nn.Module):
@@ -183,12 +208,11 @@ class Block(nn.Module):
         self.ffn = Mlp(config)
         self.attn = Attention(config)
 
-    def forward(self, x):
+    def forward(self, x, memories=None, attn_mask=None):
         h = x
         x = self.attention_norm(x)
-        x, weights = self.attn(x)
+        x, weights = self.attn(x, memories, attn_mask)
         x = x + h
-
         h = x
         x = self.ffn_norm(x)
         x = self.ffn(x)
@@ -241,8 +265,8 @@ class Part_Attention(nn.Module):
         last_map = x[0]
         for i in range(1, length):
             last_map = torch.matmul(x[i], last_map)
-        last_map = last_map[:,:,0,1:]
 
+        last_map = last_map[:,:,0,1:]
         _, max_inx = last_map.max(2)
         return _, max_inx
 
@@ -257,35 +281,44 @@ class Encoder(nn.Module):
         self.part_layer = Block(config)
         self.part_norm = LayerNorm(config.hidden_size, eps=1e-6)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, memories=None,attn_mask=None):
         attn_weights = []
-        for layer in self.layer:
-            hidden_states, weights = layer(hidden_states)
-            attn_weights.append(weights)            
-        part_num, part_inx = self.part_select(attn_weights)
-        part_inx = part_inx + 1
-        parts = []
-        B, num = part_inx.shape
-        for i in range(B):
-            parts.append(hidden_states[i, part_inx[i,:]])
-        parts = torch.stack(parts).squeeze(1)
-        concat = torch.cat((hidden_states[:,0].unsqueeze(1), parts), dim=1)
-        part_states, part_weights = self.part_layer(concat)
-        part_encoded = self.part_norm(part_states)   
-
+        for i, layer in enumerate(self.layer):
+            hidden_states, weights = layer(hidden_states, memories[i,:,:] if memories is not None else None, attn_mask)
+            attn_weights.append(weights)
+        part_encoded = self.part_norm(hidden_states)       
+        # part_num, part_inx = self.part_select(attn_weights)
+        # part_inx = part_inx + 1
+        # parts = []
+        # B, num = part_inx.shape
+        # for i in range(B):
+        #     parts.append(hidden_states[i, part_inx[i,:]])
+        # parts = torch.stack(parts).squeeze(1)
+        # concat = torch.cat((hidden_states[:,0].unsqueeze(1), parts), dim=1)
+        # part_states, part_weights = self.part_layer(concat, memories)
+        # part_encoded = self.part_norm(part_states)   
         return part_encoded
 
+# class Transformer(nn.Module):
+#     def __init__(self, config, img_size):
+#         super(Transformer, self).__init__()
+#         self.embeddings = Embeddings(config, img_size=img_size)
+#         self.encoder = Encoder(config)
+
+#     def forward(self, input_ids):
+#         embedding_output = self.embeddings(input_ids)
+#         part_encoded = self.encoder(embedding_output)
+#         return part_encoded
 class Transformer(nn.Module):
     def __init__(self, config, img_size):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
         self.encoder = Encoder(config)
 
-    def forward(self, input_ids):
-        embedding_output = self.embeddings(input_ids)
-        part_encoded = self.encoder(embedding_output)
-        return part_encoded
-
+    def forward(self, input_ids, mem_cls = None, memories=None, attn_mask=None):
+        embedding_output = self.embeddings(input_ids, mem_cls)
+        encoded = self.encoder(embedding_output, memories, attn_mask)
+        return encoded
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, smoothing_value=0, zero_head=False):
         super(VisionTransformer, self).__init__()
@@ -361,6 +394,46 @@ class VisionTransformer(nn.Module):
                     for uname, unit in block.named_children():
                         unit.load_from(weights, n_block=bname, n_unit=uname) 
 
+class Adaptor(nn.Module):
+    def __init__(self, config, vit,num_mems_per_layer=5, num_classes=21843):
+        super().__init__()
+        assert isinstance(vit,  VisionTransformer)
+        
+        dim = config.hidden_size
+        self.vit = vit
+        # num_patches = 626
+        num_patches = vit.transformer.embeddings.n_patches+1
+        # num_patches = 197
+        # vit.pos_embedding.shape[-2]
+        self.num_classes = num_classes
+        self.task_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+        freeze_all_layers_(vit)
+        self.memory_cls_tokens = nn.Parameter(torch.randn(1, 1 ,dim))
+        self.memory_per_layer = nn.Parameter(torch.randn(config.transformer["num_layers"], num_mems_per_layer, dim))
+
+        attn_mask = torch.ones((num_patches, num_patches), dtype = torch.bool)
+        attn_mask = F.pad(attn_mask, (1, num_mems_per_layer), value = False) 
+        attn_mask = F.pad(attn_mask, (0, 0, 1, 0), value = True) 
+        self.register_buffer('attn_mask', attn_mask)
+      
+
+    def forward(self, img, labels=None):
+        out = self.vit.transformer(img, mem_cls = self.memory_cls_tokens, memories = self.memory_per_layer, attn_mask = self.attn_mask)
+        memory_cls_tokens = out[:, 0]
+        logits = self.task_head(memory_cls_tokens)
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            #contrast_loss = con_loss(x[:, 0], labels.view(-1))
+            #loss = ce_loss + contrast_loss
+            return loss, logits
+        else:
+            return logits
+       
+
 def con_loss(features, labels):
     B, _ = features.shape
     features = F.normalize(features)
@@ -382,3 +455,10 @@ CONFIGS = {
     'ViT-H_14': configs.get_h14_config(),
     'testing': configs.get_testing(),
 }
+if __name__ == "__main__":
+    
+    model =  VisionTransformer(CONFIGS['ViT-B_16'])
+    img = torch.rand(1,3,224,224)
+    adaptor = Adaptor(config=CONFIGS['ViT-B_16'],vit=model)
+    print(adaptor(img))
+    print(model(img))

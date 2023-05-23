@@ -13,14 +13,14 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-import torchprofile
+# import torchprofile
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 from apex.parallel import DistributedDataParallel as DDP
 
-from models.modeling import VisionTransformer, CONFIGS
+from models.modeling import VisionTransformer, CONFIGS, Adaptor
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader
 from utils.dist_util import get_world_size
@@ -84,8 +84,10 @@ def setup(args):
         num_classes = 120
     elif args.dataset == "INat2017":
         num_classes = 5089
+    elif args.dataset == "Cifar100":
+        num_classes = 100
 
-    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes,                                                   smoothing_value=args.smoothing_value)
+    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, smoothing_value=args.smoothing_value)
 
     model.load_from(np.load(args.pretrained_dir))
     if args.pretrained_model is not None:
@@ -94,6 +96,7 @@ def setup(args):
         else:
             pretrained_model = torch.load(args.pretrained_model)['model']
         model.load_state_dict(pretrained_model)
+    model = Adaptor(config=CONFIGS['ViT-B_16'],vit=model, num_mems_per_layer=5, num_classes=num_classes)
     model.to(args.device)
     num_params = count_parameters(model)
 
@@ -325,14 +328,14 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["CUB_200_2011", "car", "dog", "nabirds", "INat2017"], default="CUB_200_2011",
+    parser.add_argument("--dataset", choices=["CUB_200_2011", "car", "dog", "nabirds", "INat2017", "Cifar100"], default="CUB_200_2011",
                         help="Which dataset.")
-    parser.add_argument('--data_root', type=str, default='./dataset')
+    parser.add_argument('--data_root', type=str, default='../../dataset')
     parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
                                                  "ViT-L_32", "ViT-H_14"],
                         default="ViT-B_16",
                         help="Which variant to use.")
-    parser.add_argument("--pretrained_dir", type=str, default="./pretrained/ViT-B_16.npz",
+    parser.add_argument("--pretrained_dir", type=str, default="./pretrained/ViT-B_32.npz",
                         help="Where to search for pretrained ViT models.")
     parser.add_argument("--pretrained_model", type=str, default=None,
                         help="load pretrained model")
@@ -348,11 +351,11 @@ def main():
                         help="Run prediction on validation set every so many steps."
                              "Will always run one evaluation at the end of training.")
 
-    parser.add_argument("--learning_rate", default=3e-2, type=float,
+    parser.add_argument("--learning_rate", default=1e-3, type=float,
                         help="The initial learning rate for SGD.")
     parser.add_argument("--weight_decay", default=0, type=float,
                         help="Weight deay if we apply some.")
-    parser.add_argument("--num_steps", default=10000, type=int,
+    parser.add_argument("--num_steps", default=20000, type=int,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--decay_type", choices=["cosine", "linear"], default="cosine",
                         help="How to decay the learning rate.")
@@ -361,7 +364,7 @@ def main():
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
 
-    parser.add_argument("--local_rank", type=int, default=-1,
+    parser.add_argument("--local_rank", type=int, default=os.getenv('LOCAL_RANK', 0),
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
@@ -393,11 +396,12 @@ def main():
                         help="do evo search")
 
     args = parser.parse_args()
-
-    # if args.fp16 and args.smoothing_value != 0:
-    #     raise NotImplementedError("label smoothing not supported for fp16 training now")
+    torch.cuda.set_device(args.local_rank)
+    if args.fp16 and args.smoothing_value != 0:
+        raise NotImplementedError("label smoothing not supported for fp16 training now")
     args.data_root = '{}/{}'.format(args.data_root, args.dataset)
     # Setup CUDA, GPU & distributed training
+
     if args.run_cpu:
         device = torch.device("cpu")
         args.n_gpu = 0
@@ -410,6 +414,7 @@ def main():
             device = torch.device("cuda", args.local_rank)
             torch.distributed.init_process_group(backend='nccl',
                                                 timeout=timedelta(minutes=60))
+           
         args.n_gpu = 1
     args.device = device
     args.nprocs = torch.cuda.device_count()
@@ -427,7 +432,7 @@ def main():
     # Model & Tokenizer Setup
     args, model = setup(args)
     # Training
-    #train(args, model)
+    train(args, model)
     if args.do_lat_mem_measure:
         if args.local_rank != -1:
             model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
@@ -466,8 +471,8 @@ def main():
         dummy_inputs = (
             torch.ones(size, dtype=torch.float).to(args.device)
         )
-        mac = torchprofile.profile_macs(model, args=dummy_inputs)
-        print("MACs: ", mac)
+        # mac = torchprofile.profile_macs(model, args=dummy_inputs)
+        # print("MACs: ", mac)
 
 
 if __name__ == "__main__":
