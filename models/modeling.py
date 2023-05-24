@@ -314,8 +314,8 @@ class VisionTransformer(nn.Module):
             self.transformer.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"], conv=True))
             self.transformer.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
             self.transformer.embeddings.cls_token.copy_(np2th(weights["cls"]))
-            self.transformer.encoder.part_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
-            self.transformer.encoder.part_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
+            self.transformer.encoder.norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
+            self.transformer.encoder.norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
 
             posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
             posemb_new = self.transformer.embeddings.position_embeddings

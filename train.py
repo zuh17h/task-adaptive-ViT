@@ -279,7 +279,7 @@ def train(args, model):
                         if best_acc < accuracy:
                             save_model(args, model)
                             best_acc = accuracy
-                        logger.info("best accuracy so far: %f" % best_acc)
+                        logger.info("best acacuracy so far: %f" % best_acc)
                     model.train()
 
                 if global_step % t_total == 0:
