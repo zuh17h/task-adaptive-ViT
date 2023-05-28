@@ -96,7 +96,7 @@ def setup(args):
         else:
             pretrained_model = torch.load(args.pretrained_model)['model']
         model.load_state_dict(pretrained_model)
-    model = Adaptor(config=CONFIGS['ViT-B_16'],vit=model, num_mems_per_layer=5, num_classes=num_classes)
+    model = Adaptor(config=CONFIGS['ViT-B_16'],vit=model, num_mems_per_layer=args.mems, num_classes=num_classes)
     model.to(args.device)
     num_params = count_parameters(model)
 
@@ -359,7 +359,7 @@ def main():
                         help="Total number of training epochs to perform.")
     parser.add_argument("--decay_type", choices=["cosine", "linear"], default="cosine",
                         help="How to decay the learning rate.")
-    parser.add_argument("--warmup_steps", default=500, type=int,
+    parser.add_argument("--warmup_steps", default=5, type=int,
                         help="Step of training to perform learning rate warmup for.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
@@ -394,6 +394,8 @@ def main():
                         help="do evo search")
     parser.add_argument("--run_cpu", action="store_true", 
                         help="do evo search")
+    parser.add_argument("--mems", type= int, default=1, 
+                        help="Number of memory tokens")
 
     args = parser.parse_args()
     torch.cuda.set_device(args.local_rank)
