@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
+from einops import rearrange, repeat
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
@@ -103,9 +103,11 @@ class Attention(nn.Module):
         kv_hidden_states = hidden_states
 
         if exists(memories):
-            memories = memories.expand(hidden_states.shape[0], -1, -1)
-            kv_hidden_states = torch.cat((kv_hidden_states, memories), dim=1)
-         
+            # memories = memories.expand(hidden_states.shape[0], -1, -1)
+            # kv_hidden_states = torch.cat((kv_hidden_states, memories), dim=1)
+            hidden_states = hidden_states[:,:-memories.shape[1],:]
+        #     print(hidden_states.shape)
+        # sys.exit()
         mixed_query_layer = self.query(hidden_states)
         mixed_key_layer = self.key(kv_hidden_states)
         mixed_value_layer = self.value(kv_hidden_states)
@@ -195,7 +197,7 @@ class Embeddings(nn.Module):
         embeddings = x + self.position_embeddings
         embeddings = self.dropout(embeddings)
         if exists(mem_cls):
-            mem_cls_token = mem_cls.expand(B, -1, -1)
+            mem_cls_token = repeat(mem_cls,'d -> b 1 d', b = B) 
             embeddings = torch.cat((mem_cls_token, embeddings), dim=1)
         return embeddings
 
@@ -210,6 +212,14 @@ class Block(nn.Module):
 
     def forward(self, x, memories=None, attn_mask=None):
         h = x
+        # print("image",x.shape)
+        if exists(memories):
+            memories = memories.expand(x.shape[0], -1, -1)
+            x = torch.cat((x, memories), dim=1)
+            # print("image",x.shape)
+            # print('memories', memories.shape)
+            # print("mems", memories[:,:-3, :].shape)
+            # sys.exit()
         x = self.attention_norm(x)
         x, weights = self.attn(x, memories, attn_mask)
         x = x + h
@@ -268,6 +278,7 @@ class Encoder(nn.Module):
     def forward(self, hidden_states, memories=None,attn_mask=None):
         attn_weights = []
         for i, layer in enumerate(self.layer):
+            # memories[i] = memories[i]+memories[i-1] if i-1>0 else memories[i]
             hidden_states, weights = layer(hidden_states, memories[i] if memories is not None else None, attn_mask)
             attn_weights.append(weights)
         encoded = self.norm(hidden_states)         
@@ -368,13 +379,11 @@ class Adaptor(nn.Module):
         num_patches = vit.transformer.embeddings.n_patches+1
        
         self.num_classes = num_classes
-        self.task_head = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, num_classes)
-        )
+        self.task_head = nn.Linear(dim, num_classes)
+
         freeze_all_layers_(vit)
-        self.memory_cls_tokens = nn.Parameter(torch.randn(1, 1 ,dim))
-        self.memory_per_layer = nn.Parameter(torch.randn(config.transformer["num_layers"], num_mems_per_layer, dim))
+        self.memory_cls_tokens = nn.Parameter(torch.randn(dim))
+        self.memory_per_layer = nn.Parameter(torch.randn(config.transformer["num_layers"], num_mems_per_layer, dim)*0.02)
 
         attn_mask = torch.ones((num_patches, num_patches), dtype = torch.bool)
         attn_mask = F.pad(attn_mask, (1, num_mems_per_layer), value = False) 
@@ -383,7 +392,7 @@ class Adaptor(nn.Module):
       
 
     def forward(self, img, labels=None):
-        out = self.vit.transformer(img, mem_cls = self.memory_cls_tokens, memories = self.memory_per_layer, attn_mask = self.attn_mask)
+        out = self.vit.transformer(img,mem_cls= self.memory_cls_tokens, memories = self.memory_per_layer, attn_mask = self.attn_mask)
         memory_cls_tokens = out[:, 0]
         logits = self.task_head(memory_cls_tokens)
         if labels is not None:
@@ -420,6 +429,6 @@ if __name__ == "__main__":
     
     model =  VisionTransformer(CONFIGS['ViT-B_16'])
     img = torch.rand(1,3,224,224)
-    adaptor = Adaptor(config=CONFIGS['ViT-B_16'],vit=model)
+    adaptor = Adaptor(config=CONFIGS['ViT-B_16'],vit=model, num_mems_per_layer=5)
     print(adaptor(img))
     print(model(img))
